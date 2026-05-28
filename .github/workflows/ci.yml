@@ -1,0 +1,257 @@
+###############################################################################
+# CI/CD Pipeline – System Health Check API
+#
+# Triggers:
+#   push to main        → test → security → build → deploy (dev)
+#   pull_request/main   → test + security only (no push, no deploy)
+#   workflow_dispatch   → test → security → build → deploy to chosen environment
+#
+# GitHub Secrets required (Settings → Secrets → Actions):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   ALB_DNS               e.g. system-health-api-dev-alb-123.us-east-1.elb.amazonaws.com
+#
+# GitHub Variables required (Settings → Variables → Actions):
+#   AWS_REGION            e.g. us-east-1          (variable, not secret — supports fallback)
+#   ECR_REPOSITORY        e.g. system-health-api-dev-api
+#
+# Per-environment variables (Settings → Environments → <env> → Variables):
+#   TASK_DEFINITION_FAMILY   e.g. system-health-api-dev-api
+#   ECS_SERVICE              e.g. system-health-api-dev-service
+#   ECS_CLUSTER              e.g. system-health-api-dev-cluster
+#
+# Issue 8 fix: AWS_REGION moved from secrets to vars context, which correctly
+# supports the || fallback operator. Secrets always evaluate to empty string
+# when unset, so the fallback never fires in the secrets context.
+###############################################################################
+
+name: CI / CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Issue 8 fix: vars context (not secrets) supports || fallback correctly.
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  # ── Lint & Test ─────────────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        # Issue 9 fix: install both runtime and dev deps from pinned files.
+        # ruff and pyright are now version-locked in requirements-dev.txt
+        # instead of being fetched unpinned at runtime.
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check app/ tests/
+
+      - name: Type check (pyright)
+        run: pyright app/ || true   # non-blocking — promotes adoption incrementally
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --asyncio-mode=auto \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Security scan ────────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        # Issue 4 fix: pinned to a specific release tag instead of @master.
+        # Update this pin deliberately when you want to pick up new Trivy rules.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: "."
+          severity: HIGH,CRITICAL
+          exit-code: "0"      # warn only; flip to "1" to make this gate blocking
+
+      - name: Run Bandit (Python SAST)
+        # bandit is pinned in requirements-dev.txt
+        run: |
+          pip install -r requirements-dev.txt -q
+          bandit -r app/ -ll || true
+
+  # ── Build & Push Docker image ────────────────────────────────────────────────
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    outputs:
+      # Issue 1 fix: image_uri is NOT an output of docker/build-push-action.
+      # We construct it ourselves from the immutable SHA tag so downstream
+      # jobs always reference the exact image that was just built and pushed.
+      image_uri: ${{ steps.build_uri.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags:      ${{ steps.meta.outputs.tags }}
+          labels:    ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+
+      # Issue 1 fix: construct the canonical image URI from the immutable SHA
+      # tag. steps.meta.outputs.version is the short SHA (e.g. "a1b2c3d").
+      - name: Derive image URI
+        id: build_uri
+        run: |
+          IMAGE_URI="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "Built image: ${IMAGE_URI}"
+
+      # Issue 2 fix: reference the single immutable SHA-tagged URI instead of
+      # steps.meta.outputs.tags (which is a multi-line string of all three tags
+      # and is not a valid image reference for Trivy).
+      - name: Run Trivy vulnerability scanner (image)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref:  ${{ steps.build_uri.outputs.image_uri }}
+          severity:   HIGH,CRITICAL
+          exit-code:  "0"
+
+  # ── Deploy (ECS rolling update) ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build
+    # Issue 3 fix: removed the explicit if condition that allowed
+    # workflow_dispatch from any branch to deploy.
+    # Protection is now enforced entirely by GitHub environment rules:
+    # Settings → Environments → <env> → Required reviewers / branch policies.
+    # This means prod always requires approval regardless of how the run starts.
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      # Issue 7 fix: task definition family name is read from a per-environment
+      # GitHub variable (TASK_DEFINITION_FAMILY) instead of being hardcoded.
+      # Set this in Settings → Environments → <env> → Variables to match your
+      # Terraform output (terraform output -raw ecs_task_definition_family).
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ vars.TASK_DEFINITION_FAMILY }}" \
+            --query taskDefinition \
+            > task-definition.json
+          echo "Task definition family: ${{ vars.TASK_DEFINITION_FAMILY }}"
+
+      - name: Update task definition with new image
+        id: task-def
+        # Issue 5 fix: pinned to @v2 (current latest) for improved env-var
+        # handling; @v1 was a mutable tag tracking latest v1.x patch releases.
+        uses: aws-actions/amazon-ecs-render-task-definition@v2
+        with:
+          task-definition: task-definition.json
+          container-name:  api
+          # Issue 1 fix: uses the correctly constructed image_uri from the
+          # build job instead of the previously empty string.
+          image: ${{ needs.build.outputs.image_uri }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition:            ${{ steps.task-def.outputs.task-definition }}
+          # Issue 7 fix: service and cluster names from per-environment variables.
+          service:                    ${{ vars.ECS_SERVICE }}
+          cluster:                    ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes:           15
+
+      # Issue 6 fix: removed sleep 10. The preceding deploy step already blocks
+      # with wait-for-service-stability: true until ECS reports the new tasks
+      # healthy and the old ones drained. Any curl run immediately after is
+      # guaranteed to hit the new task — the sleep was both redundant and too
+      # short (ECS rotations typically take 60-180 s).
+      - name: Smoke test deployed API
+        run: |
+          HEALTH=$(curl -sf "http://${{ secrets.ALB_DNS }}/health" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])")
+          echo "Health status: ${HEALTH}"
+          [ "${HEALTH}" = "healthy" ] || exit 1

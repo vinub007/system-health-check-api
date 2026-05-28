@@ -1,0 +1,28 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+prometheus-client==0.21.1
+
+# Optional: DAG visualization
+matplotlib==3.9.3
+networkx==3.4.2
+
+# Dev / test
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+
+# OpenTelemetry tracing
+# Fix issue 5: pinned to GA API/SDK; instrumentation 0.49b2 is the current
+# stable pre-release that pairs with API 1.28.x (OTel Python convention:
+# instrumentation minor = API minor, with 'b' suffix indicating pre-release).
+# Track https://github.com/open-telemetry/opentelemetry-python/releases and
+# drop the 'b' suffix once a stable instrumentation release ships.
+opentelemetry-api==1.28.2
+opentelemetry-sdk==1.28.2
+opentelemetry-instrumentation-fastapi==0.49b2
+# Fix issue 4: OTLP gRPC exporter — required to actually export spans to
+# Jaeger / Grafana Tempo / OTel Collector. Was missing from previous version.
+opentelemetry-exporter-otlp-proto-grpc==1.28.2
