@@ -45,6 +45,7 @@ env:
   PYTHON_VERSION: "3.12"
   # Issue 8 fix: vars context (not secrets) supports || fallback correctly.
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ── Lint & Test ─────────────────────────────────────────────────────────────
@@ -101,7 +102,7 @@ jobs:
       - name: Run Trivy vulnerability scanner (filesystem)
         # Issue 4 fix: pinned to a specific release tag instead of @master.
         # Update this pin deliberately when you want to pick up new Trivy rules.
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: "."
@@ -181,7 +182,7 @@ jobs:
       # steps.meta.outputs.tags (which is a multi-line string of all three tags
       # and is not a valid image reference for Trivy).
       - name: Run Trivy vulnerability scanner (image)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref:  ${{ steps.build_uri.outputs.image_uri }}
           severity:   HIGH,CRITICAL
